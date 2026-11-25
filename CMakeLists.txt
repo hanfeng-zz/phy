@@ -23,10 +23,10 @@ target_include_directories(yt8521sh_lib
 target_link_libraries(yt8521sh_lib
     INTERFACE mdio_c++_lib)
 
-#test
-add_executable(mdio_test test.cpp)
-target_link_libraries(mdio_test
-    PRIVATE mdio_c_lib
-    PRIVATE mdio_c++_lib
-    PRIVATE yt8521sh_lib
+# yt8531 lib
+add_library(yt8531_lib INTERFACE)
+target_include_directories(yt8531_lib
+    INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include/yt8531
 )
+target_link_libraries(yt8531_lib
+    INTERFACE mdio_c++_lib)

@@ -8,7 +8,9 @@
 #pragma once
 
 #include "mdioc++.h"
+#include <chrono>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #define YT8521_PER_STEP_PS  150
@@ -284,86 +286,388 @@ public:
         return write_ext(YT8521_REG_EXT_CHIP_CONFIG, val);
     }
 
-    void detect() {
-        uint16_t val, val1, val2, val3, val4, val5, speed;
-
-        int rc = read_ext(YT8521_REG_EXT_SMI_SDS_PHY, val);
-        if (rc) {
-            std::cout << "read:0x" << std::hex << YT8521_REG_EXT_SMI_SDS_PHY << " failed!" << std::endl;
-            return;
+    // 根据 work mode 选择 UTP/SDS packet checker，周期读取报文计数。
+    //
+    // UTP page:
+    //   0xA0 Pkg Cfg0, 0xA3/0xA4 Rx Valid, 0xA9 Rx Err,
+    //   0xAD/0xAE Tx Valid, 0xB3 Tx Err
+    // SDS page:
+    //   0x1A0/0x1A3/0x1A4/0x1A9/0x1AD/0x1AE/0x1B3
+    //
+    // Pkg Cfg0 bit15 Pkg_chk_en 必须先置 1；计数寄存器为 read-clear。
+    int probePacketCounters(uint32_t periodSeconds, uint32_t count) {
+        if ((0U == periodSeconds) || (0U == count)) {
+            return -1;
         }
 
-        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_SMI_SDS_PHY << " val:0x" << std::hex << val << std::endl;
-        std::cout << "space:" << getAccessSpace(val) << std::endl;
-
-        rc = read_ext(YT8521_REG_EXT_CHIP_CONFIG, val1);
-        if (rc) {
-            std::cout << "read:0x" << std::hex << YT8521_REG_EXT_CHIP_CONFIG << " failed!" << std::endl;
-            return;
+        uint16_t chipConfig = 0;
+        if (read_ext(YT8521_REG_EXT_CHIP_CONFIG, chipConfig) != 0) {
+            return -1;
+        }
+        const auto workmode = getWorkMode(chipConfig);
+        bool useUtp = false;
+        bool useSds = false;
+        switch (workmode) {
+            case YT8521_WM_UTP_TO_RGMII:
+                useUtp = true;
+                break;
+            case YT8521_WM_FIBER_TO_RGMII:
+            case YT8521_WM_SGPHY_TO_RGMAC:
+            case YT8521_WM_SGMAC_TO_RGPHY:
+                useSds = true;
+                break;
+            case YT8521_WM_UTP_FIBER_TO_RGMII:
+            case YT8521_WM_UTP_TO_SGMII:
+            case YT8521_WM_UTP_TO_FIBER_AUTO:
+            case YT8521_WM_UTP_TO_FIBER_FORCE:
+                useUtp = true;
+                useSds = true;
+                break;
+            default:
+                return -1;
         }
 
-        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_CHIP_CONFIG << " val:0x" << std::hex << val1 << std::endl;
-        std::cout << "work mode:" << getChipMode(val1) << std::endl;
-        std::cout << "Rgmii Ldo:" << ((val1 & YT8521_BITS_ENABLE_IDO) ? "enable" : "disable") << std::endl;
-        std::cout << "Rgmii Ldo voltage control:" << getChipCfgIdo(val1) << std::endl;
-        std::cout << "Rgmii clk 2ns delay control:" << (val1 & YT8521_BITS_RGMII_CLK_DELAY_ENABLE ? "enable" : "disable") << std::endl;
-
-        rc = read_ext(YT8521_REG_EXT_SDS_CONFIG, val2);
-        if (rc) {
-            std::cout << "read:0x" << std::hex << YT8521_REG_EXT_SDS_CONFIG << " failed!" << std::endl;
-            return;
+        struct packet_page {
+            bool sds;
+            uint16_t base;
+            uint16_t originalConfig;
+            bool enabledByProbe;
+        };
+        packet_page pages[2] = {};
+        uint32_t page_count = 0;
+        if (useUtp) {
+            pages[page_count].sds = false;
+            pages[page_count].base = 0x00A0U;
+            page_count++;
+        }
+        if (useSds) {
+            pages[page_count].sds = true;
+            pages[page_count].base = 0x01A0U;
+            page_count++;
         }
 
-        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_SDS_CONFIG << " val:0x" << std::hex << val2 << std::endl;
-        std::cout << "surppress txer:" << (val2 & YT8521_BITS_ENABLE_SURPPRESS_TXER ? "enable" : "disable") << std::endl;
-
-        rc = read_ext(YT8521_REG_EXT_RGMII_CONFIG1, val3);
-        if (rc) {
-            std::cout << "read:0x" << std::hex << YT8521_REG_EXT_RGMII_CONFIG1 << " failed!" << std::endl;
-            return;
+        uint16_t originalAccess = 0;
+        if (read_ext(YT8521_REG_EXT_SMI_SDS_PHY, originalAccess) != 0) {
+            return -1;
         }
 
-        rc = read_ext(YT8521_REG_EXT_RGMII_CONFIG2, val4);
-        if (rc) {
-            std::cout << "read:0x" << std::hex << YT8521_REG_EXT_RGMII_CONFIG2 << " failed!" << std::endl;
-            return;
-        }
+        auto selectPage = [&](bool sds) -> int {
+            uint16_t access = static_cast<uint16_t>(originalAccess & ~0x0002U);
+            if (sds) {
+                access = static_cast<uint16_t>(access | 0x0002U);
+            }
+            return write_ext(YT8521_REG_EXT_SMI_SDS_PHY, access);
+        };
 
-        rc = read_ext(YT8521_REG_EXT_MDIO_CFG_AND_RGMII_OOB_MON, val5);
-        if (rc) {
-            std::cout << "read:0x" << std::hex << YT8521_REG_EXT_MDIO_CFG_AND_RGMII_OOB_MON << " failed!" << std::endl;
-            return;
-        }
-
-        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_RGMII_CONFIG1 << " val:0x" << std::hex << val3 << std::endl;
-        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_RGMII_CONFIG2 << " val:0x" << std::hex << val4 << std::endl;
-        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_MDIO_CFG_AND_RGMII_OOB_MON << " val:0x" << std::hex << val5 << std::endl;
-
-        auto workmode = getWorkMode(val3);
-
-        if (YT8521_WM_SGPHY_TO_RGMAC == workmode) {
-            if (val3 & YT8521_BITS_RGMII_CFG1_RGMAC_CFG_MODE) {
-                //0xa004
-                speed = (val4 >> 6) & 0x3;
-                std::cout << "rgmii mac config info:\nspeed:0x" << std::hex << speed
-                          << " duplex:" << (val4 & YT8521_BITS_RGMII_CFG2_DUPLEX_RGMAC ? "true" : "false")
-                          << " link:" << (val4 & YT8521_BITS_RGMII_CFG2_LINK_UP_RGMAC ? "up" : "down")
-                          << std::endl;
-            } else {
-                //0xa005
-                speed = val5 >> 14;
-                std::cout << "rgmii mac oob info:\nspeed:0x" << std::hex << speed
-                          << " duplex:" << (val4 & YT8521_BITS_DUPLEX_RGMAC_OB ? "true" : "false")
-                          << " link:" << (val4 & YT8521_BITS_LINKUP_RGMAC_OB ? "up" : "down")
-                          << std::endl;
+        for (uint32_t pageIndex = 0; pageIndex < page_count; pageIndex++) {
+            packet_page& page = pages[pageIndex];
+            if (selectPage(page.sds) != 0 ||
+                read_ext(page.base, page.originalConfig) != 0) {
+                return -1;
+            }
+            page.enabledByProbe = ((page.originalConfig & 0x8000U) == 0U);
+            if (page.enabledByProbe) {
+                uint16_t config = static_cast<uint16_t>(page.originalConfig | 0x8000U);
+                if (write_ext(page.base, config) != 0) {
+                    return -1;
+                }
             }
         }
 
-        std::cout << "rgmii rx_clk delay(ps):" << std::dec << getRgmiiRxDelay(val3) << std::endl;
-        std::cout << "rgmii tx_clk fe delay(ps):" << std::dec << getRgmiiTxDelayFe(val3) << std::endl;
-        std::cout << "rgmii tx_clk delay(ps):" << std::dec << getRgmiiTxDelay(val3) << std::endl;
+        uint32_t totalRx[2] = {};
+        uint32_t totalTx[2] = {};
+        uint32_t totalRxErr[2] = {};
+        uint32_t totalTxErr[2] = {};
 
+        int result = 0;
+        for (uint32_t sample = 0; sample < count; sample++) {
+            for (uint32_t pageIndex = 0; pageIndex < page_count; pageIndex++) {
+                const packet_page& page = pages[pageIndex];
+                if (selectPage(page.sds) != 0) {
+                    result = -1;
+                    break;
+                }
 
+                uint16_t rxHigh = 0;
+                uint16_t rxLow = 0;
+                uint16_t txHigh = 0;
+                uint16_t txLow = 0;
+                uint16_t rxErr = 0;
+                uint16_t txErr = 0;
+                if (read_ext(static_cast<uint16_t>(page.base + 0x03U), rxHigh) != 0 ||
+                    read_ext(static_cast<uint16_t>(page.base + 0x04U), rxLow) != 0 ||
+                    read_ext(static_cast<uint16_t>(page.base + 0x0DU), txHigh) != 0 ||
+                    read_ext(static_cast<uint16_t>(page.base + 0x0EU), txLow) != 0 ||
+                    read_ext(static_cast<uint16_t>(page.base + 0x09U), rxErr) != 0 ||
+                    read_ext(static_cast<uint16_t>(page.base + 0x13U), txErr) != 0) {
+                    result = -1;
+                    break;
+                }
+
+                const uint32_t rxPackets = (static_cast<uint32_t>(rxHigh) << 16U) | rxLow;
+                const uint32_t txPackets = (static_cast<uint32_t>(txHigh) << 16U) | txLow;
+                totalRx[pageIndex] += rxPackets;
+                totalTx[pageIndex] += txPackets;
+                totalRxErr[pageIndex] += rxErr;
+                totalTxErr[pageIndex] += txErr;
+
+                std::cout << "packet:" << (sample + 1U) << "/" << count
+                          << " page:" << (page.sds ? "SDS" : "UTP")
+                          << " rxPackets:" << rxPackets
+                          << " txPackets:" << txPackets
+                          << " rxErr:" << rxErr
+                          << " txErr:" << txErr
+                          << " totalRx:" << totalRx[pageIndex]
+                          << " totalTx:" << totalTx[pageIndex]
+                          << " totalRxErr:" << totalRxErr[pageIndex]
+                          << " totalTxErr:" << totalTxErr[pageIndex]
+                          << std::endl;
+            }
+            if (result != 0) {
+                break;
+            }
+            if ((sample + 1U) < count) {
+                std::this_thread::sleep_for(std::chrono::seconds(periodSeconds));
+            }
+        }
+
+        for (uint32_t pageIndex = 0; pageIndex < page_count; pageIndex++) {
+            const packet_page& page = pages[pageIndex];
+            if (selectPage(page.sds) != 0) {
+                result = -1;
+                continue;
+            }
+            if (page.enabledByProbe) {
+                uint16_t config = page.originalConfig;
+                if (write_ext(page.base, config) != 0) {
+                    result = -1;
+                }
+            }
+        }
+        uint16_t restoreAccess = originalAccess;
+        if (write_ext(YT8521_REG_EXT_SMI_SDS_PHY, restoreAccess) != 0) {
+            result = -1;
+        }
+
+        return result;
+    }
+
+    int detect() {
+        uint16_t id1 = 0;
+        uint16_t id2 = 0;
+        if ((read(YT8521_REG_PHY_IDENTIFICATION_REG1, id1) != 0) ||
+            (read(YT8521_REG_PHY_IDENTIFICATION_REG2, id2) != 0)) {
+            std::cout << "read PHY identification failed" << std::endl;
+            return -1;
+        }
+        std::cout << "phy id1:0x" << std::hex << id1 << " id2:0x" << id2 << std::dec << std::endl;
+
+        uint16_t access = 0;
+        uint16_t chipConfig = 0;
+        uint16_t sdsConfig = 0;
+        uint16_t rgmiiConfig1 = 0;
+        uint16_t rgmiiConfig2 = 0;
+        uint16_t mdioConfig = 0;
+        uint16_t miscConfig = 0;
+        uint16_t oobStatus = 0;
+        uint16_t basicControl = 0;
+        uint16_t basicStatus = 0;
+        uint16_t phyStatus = 0;
+        uint16_t sdsStatus = 0;
+        uint16_t rxError = 0;
+
+        if (read_ext(YT8521_REG_EXT_SMI_SDS_PHY, access) != 0) {
+            std::cout << "read 0xA000 failed!" << std::endl;
+            return -1;
+        }
+        const bool sds = ((access & 0x2U) != 0U);
+        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_SMI_SDS_PHY
+                  << " val:0x" << access << std::dec
+                  << " ---> space:" << getAccessSpace(access) << std::endl;
+
+        if (read(YT8521_REG_BASIC_CONTROL_REG, basicControl) != 0) {
+            std::cout << "read Basic Control failed!" << std::endl;
+            return -1;
+        }
+        if (read(YT8521_REG_BASIC_CONTROL_STATUS, basicStatus) != 0) {
+            std::cout << "read Basic Status failed!" << std::endl;
+            return -1;
+        }
+        if (sds) {
+            if (read(YT8521_REG_SDS_MII_SDS_SPEC_STATUS_REG, sdsStatus) != 0) {
+                std::cout << "read SDS Specific Status failed!" << std::endl;
+                return -1;
+            }
+        } else if (read(YT8521_REG_PHY_SPECIFIC_FUNCTION_STATUS_REG, phyStatus) != 0) {
+            std::cout << "read PHY Specific Status failed!" << std::endl;
+            return -1;
+        }
+        if (read(YT8521_REG_RX_ERROR_COUNTER_REG, rxError) != 0) {
+            std::cout << "read RX Error Counter failed!" << std::endl;
+            return -1;
+        }
+
+        if (read_ext(YT8521_REG_EXT_CHIP_CONFIG, chipConfig) != 0) {
+            std::cout << "read 0xA001 failed!" << std::endl;
+            return -1;
+        }
+        const auto workmode = getWorkMode(chipConfig);
+        const bool hasSerdes = (workmode == YT8521_WM_FIBER_TO_RGMII) ||
+                               (workmode == YT8521_WM_UTP_FIBER_TO_RGMII) ||
+                               (workmode == YT8521_WM_UTP_TO_SGMII) ||
+                               (workmode == YT8521_WM_SGPHY_TO_RGMAC) ||
+                               (workmode == YT8521_WM_SGMAC_TO_RGPHY) ||
+                               (workmode == YT8521_WM_UTP_TO_FIBER_AUTO) ||
+                               (workmode == YT8521_WM_UTP_TO_FIBER_FORCE);
+        const bool hasRgmii = (workmode == YT8521_WM_UTP_TO_RGMII) ||
+                              (workmode == YT8521_WM_FIBER_TO_RGMII) ||
+                              (workmode == YT8521_WM_UTP_FIBER_TO_RGMII) ||
+                              (workmode == YT8521_WM_SGPHY_TO_RGMAC) ||
+                              (workmode == YT8521_WM_SGMAC_TO_RGPHY);
+        const bool rgmiiIsPhy = (workmode == YT8521_WM_UTP_TO_RGMII) ||
+                                (workmode == YT8521_WM_FIBER_TO_RGMII) ||
+                                (workmode == YT8521_WM_UTP_FIBER_TO_RGMII) ||
+                                (workmode == YT8521_WM_SGMAC_TO_RGPHY);
+        const bool rgmiiIsMac = (workmode == YT8521_WM_SGPHY_TO_RGMAC);
+
+        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_CHIP_CONFIG
+                  << " val:0x" << chipConfig << std::dec << std::endl;
+        std::cout << "work mode:" << getChipMode(chipConfig) << std::endl;
+        const uint16_t configuredSpeed = ((basicControl & 0x0040U) ? 2U : 0U) |
+                                         ((basicControl & 0x2000U) ? 1U : 0U);
+        std::cout << "config: autoNeg:" << ((basicControl & 0x1000U) ? "on" : "off")
+                  << " speed:" << speedName(configuredSpeed)
+                  << " duplex:" << ((basicControl & 0x0100U) ? "full" : "half")
+                  << " loopback:" << ((basicControl & 0x4000U) ? "on" : "off")
+                  << " powerDown:" << ((basicControl & 0x0800U) ? "on" : "off")
+                  << " isolate:" << ((basicControl & 0x0400U) ? "on" : "off")
+                  << " reset:" << ((basicControl & 0x8000U) ? "yes" : "no") << std::endl;
+        if (read_ext(YT8521_REG_EXT_MISC_CONFIG, miscConfig) != 0) {
+            std::cout << "read 0xA006 failed!" << std::endl;
+            return -1;
+        }
+        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_MISC_CONFIG
+                  << " val:0x" << miscConfig << std::dec << std::endl;
+        std::cout << "misc config: fiberHighPriority:" << ((miscConfig & 0x0100U) ? "yes" : "no")
+                  << " jumbo:" << ((miscConfig & 0x0080U) ? "enable" : "disable")
+                  << " sdsRemoteLoopback:" << ((miscConfig & 0x0040U) ? "enable" : "disable")
+                  << " phyRemoteLoopback:" << ((miscConfig & 0x0020U) ? "enable" : "disable")
+                  << std::endl;
+
+        if (hasSerdes) {
+            if (read_ext(YT8521_REG_EXT_SDS_CONFIG, sdsConfig) != 0) {
+                std::cout << "read 0xA002 failed!" << std::endl;
+                return -1;
+            }
+            std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_SDS_CONFIG
+                      << " val:0x" << sdsConfig << std::dec << std::endl;
+            std::cout << "suppress TXER:"
+                      << ((sdsConfig & YT8521_BITS_ENABLE_SURPPRESS_TXER) ? "enable" : "disable")
+                      << std::endl;
+        }
+
+        if (hasRgmii) {
+            std::cout << "RGMII LDO:" << ((chipConfig & YT8521_BITS_ENABLE_IDO) ? "enable" : "disable") << std::endl;
+            std::cout << "RGMII LDO voltage:" << getChipCfgIdo(chipConfig) << std::endl;
+            std::cout << "RGMII 2ns clock delay:"
+                      << ((chipConfig & YT8521_BITS_RGMII_CLK_DELAY_ENABLE) ? "enable" : "disable")
+                      << std::endl;
+        }
+
+        if (read_ext(YT8521_REG_EXT_MDIO_CFG_AND_RGMII_OOB_MON, mdioConfig) != 0) {
+            std::cout << "read 0xA005 failed!" << std::endl;
+            return -1;
+        }
+        std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_MDIO_CFG_AND_RGMII_OOB_MON
+                  << " val:0x" << mdioConfig << std::dec << std::endl;
+        std::cout << "MDIO config: watchdogBypass:" << ((mdioConfig & 0x0400U) ? "yes" : "no")
+                  << " phyAddr0:" << ((mdioConfig & 0x0040U) ? "yes" : "no")
+                  << " broadcast:" << ((mdioConfig & 0x0020U) ? "yes" : "no")
+                  << " broadcastAddr:" << (mdioConfig & 0x001FU) << std::endl;
+
+        const uint16_t status = sds ? sdsStatus : phyStatus;
+        const uint16_t speedBits = (status >> 14U) & 0x3U;
+        const bool linkUp = ((status & 0x0400U) != 0U);
+        const bool duplexFull = ((status & 0x2000U) != 0U);
+        const bool autoNegEnabled = ((basicControl & 0x1000U) != 0U);
+        const bool autoNegDone = ((basicStatus & 0x0020U) != 0U) || ((status & 0x0800U) != 0U);
+        const bool remoteFault = ((basicStatus & 0x0010U) != 0U);
+
+        std::cout << "media:" << (sds ? "SDS" : "UTP")
+                  << " status:0x" << std::hex << status << std::dec
+                  << " link:" << (linkUp ? "up" : "down")
+                  << " speed:" << speedName(speedBits)
+                  << " duplexBit:" << (duplexFull ? 1 : 0)
+                  << " autoNeg:" << (!autoNegEnabled ? "off" : (autoNegDone ? "done" : "busy"))
+                  << " remoteFault:" << (remoteFault ? "yes" : "no") << std::endl;
+
+        if (hasRgmii) {
+            if (read_ext(YT8521_REG_EXT_RGMII_CONFIG1, rgmiiConfig1) != 0) {
+                std::cout << "read 0xA003 failed!" << std::endl;
+                return -1;
+            }
+            if (read_ext(YT8521_REG_EXT_RGMII_CONFIG2, rgmiiConfig2) != 0) {
+                std::cout << "read 0xA004 failed!" << std::endl;
+                return -1;
+            }
+
+            std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_RGMII_CONFIG1
+                      << " val:0x" << rgmiiConfig1 << std::dec << std::endl;
+            std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_RGMII_CONFIG2
+                      << " val:0x" << rgmiiConfig2 << std::dec << std::endl;
+            std::cout << "RGMII config: txClkSel:"
+                      << ((rgmiiConfig1 & YT8521_BITS_RGMII_CFG1_TX_CLK_SEL) ? "inverted" : "normal")
+                      << " crs:" << ((rgmiiConfig1 & 0x0100U) ? "enable" : "disable")
+                      << " fdCrs:" << ((rgmiiConfig1 & 0x0200U) ? "enable" : "disable");
+            if (rgmiiIsMac) {
+                std::cout << " rgmacCfgMode:"
+                          << ((rgmiiConfig1 & YT8521_BITS_RGMII_CFG1_RGMAC_CFG_MODE) ? "register" : "oob");
+            }
+            std::cout << std::endl;
+
+            if (rgmiiIsPhy) {
+                std::cout << "RGMII PHY: speed:" << speedName(getSpeedRgPhy(rgmiiConfig2))
+                          << " duplexBit:"
+                          << ((rgmiiConfig2 & YT8521_BITS_RGMII_CFG2_DUPLEX_RGPHY) ? 1 : 0)
+                          << " link:"
+                          << ((rgmiiConfig2 & YT8521_BITS_RGMII_CFG2_LINK_UP_RGPHY) ? "up" : "down")
+                          << std::endl;
+            }
+
+            if (rgmiiIsMac) {
+                if (rgmiiConfig1 & YT8521_BITS_RGMII_CFG1_RGMAC_CFG_MODE) {
+                    std::cout << "RGMII MAC: speed:" << speedName(getSpeedRgMac(rgmiiConfig2))
+                              << " duplexBit:"
+                              << ((rgmiiConfig2 & YT8521_BITS_RGMII_CFG2_DUPLEX_RGMAC) ? 1 : 0)
+                              << " link:"
+                              << ((rgmiiConfig2 & YT8521_BITS_RGMII_CFG2_LINK_UP_RGMAC) ? "up" : "down")
+                              << std::endl;
+                } else {
+                    if (read_ext(YT8521_REG_EXT_MDIO_CFG_AND_RGMII_OOB_MON, oobStatus) != 0) {
+                        std::cout << "read 0xA005 failed!" << std::endl;
+                        return -1;
+                    }
+                    std::cout << "reg:0x" << std::hex << YT8521_REG_EXT_MDIO_CFG_AND_RGMII_OOB_MON
+                              << " val:0x" << oobStatus << std::dec << std::endl;
+                    std::cout << "RGMII MAC OOB: speed:" << speedName((oobStatus >> 14U) & 0x3U)
+                              << " duplexBit:"
+                              << ((oobStatus & YT8521_BITS_DUPLEX_RGMAC_OB) ? 1 : 0)
+                              << " link:"
+                              << ((oobStatus & YT8521_BITS_LINKUP_RGMAC_OB) ? "up" : "down")
+                              << " watchdogBypass:" << ((oobStatus & 0x0400U) ? "yes" : "no")
+                              << " phyAddr0:" << ((oobStatus & 0x0040U) ? "yes" : "no")
+                              << " broadcast:" << ((oobStatus & 0x0020U) ? "yes" : "no")
+                              << std::endl;
+                }
+            }
+
+            std::cout << "RGMII RX clock delay(ps):" << getRgmiiRxDelay(rgmiiConfig1) << std::endl;
+            std::cout << "RGMII TX clock FE delay(ps):" << getRgmiiTxDelayFe(rgmiiConfig1) << std::endl;
+            std::cout << "RGMII TX clock delay(ps):" << getRgmiiTxDelay(rgmiiConfig1) << std::endl;
+        }
+
+        std::cout << "RX error counter:0x" << std::hex << rxError << std::dec << std::endl;
+        return 0;
     }
     //note: MdioDriver auto close
 protected:
@@ -421,11 +725,20 @@ protected:
 /*-------------------------0xA003-----end-----------------------------*/
 
 /*-------------------------0xA004-----start-----------------------------*/
-    uint16_t getSpeedRgPhy(const int16_t &val) {
-        return val >> 14;
+    static const char *speedName(uint16_t speed) {
+        switch (speed & 0x3U) {
+            case 0U: return "10M";
+            case 1U: return "100M";
+            case 2U: return "1000M";
+            default: return "reserved";
+        }
     }
-    uint16_t getSpeedRgMac(const int16_t &val) {
-        return val >> 6;
+
+    uint16_t getSpeedRgPhy(uint16_t val) {
+        return (val >> 14) & 0x3;
+    }
+    uint16_t getSpeedRgMac(uint16_t val) {
+        return (val >> 6) & 0x3;
     }
 /*-------------------------0xA004-----end-----------------------------*/
 private:
